@@ -3,6 +3,8 @@ package com.laizycoder.musiflac
 import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -55,6 +57,9 @@ import com.laizycoder.musiflac.ui.screens.NowPlayingScreen
 import com.laizycoder.musiflac.ui.screens.ExtensionScreen
 import com.laizycoder.musiflac.ui.screens.OnlineScreen
 import com.laizycoder.musiflac.ui.screens.SettingsScreen
+import com.laizycoder.musiflac.ui.screens.ScanningScreen
+import com.laizycoder.musiflac.ui.screens.FilesFoldersScreen
+import com.laizycoder.musiflac.ui.screens.LibraryScreen
 import com.laizycoder.musiflac.ui.screens.ThemeOption
 import com.laizycoder.musiflac.ui.theme.MusiFlacTheme
 import java.io.File
@@ -75,7 +80,15 @@ private fun MusiFlacApp(
     musicPlayer: MusicPlayer,
     extensionManager: ExtensionManager,
     currentTrack: MusicTrack?,
-    onTrackSelected: (MusicTrack) -> Unit
+    onTrackSelected: (MusicTrack) -> Unit,
+    onDownloadComplete: () -> Unit,
+    onRescan: () -> Unit,
+    onDeepRescan: () -> Unit,
+    rescanResultCount: Int?,
+    deepScanning: Boolean,
+    deepFoundCount: Int,
+    deepTotalCount: Int,
+    onDismissScanResult: () -> Unit
 ) {
     var selectedTab by remember {
         mutableStateOf(AppTab.Home)
@@ -110,6 +123,14 @@ private fun MusiFlacApp(
     }
 
     var showExtensions by remember {
+        mutableStateOf(false)
+    }
+
+    var showScanning by remember {
+        mutableStateOf(false)
+    }
+
+    var showFilesFolders by remember {
         mutableStateOf(false)
     }
 
@@ -173,6 +194,35 @@ private fun MusiFlacApp(
             )
 
         } else if (
+            selectedTab == AppTab.Settings &&
+            showScanning
+        ) {
+
+            ScanningScreen(
+                onBack = {
+                    showScanning = false
+                },
+                onRescan = onRescan,
+                onDeepRescan = onDeepRescan,
+                rescanResultCount = rescanResultCount,
+                deepScanning = deepScanning,
+                deepFoundCount = deepFoundCount,
+                deepTotalCount = deepTotalCount,
+                onDismissScanResult = onDismissScanResult
+            )
+
+        } else if (
+            selectedTab == AppTab.Settings &&
+            showFilesFolders
+        ) {
+
+            FilesFoldersScreen(
+                onBack = {
+                    showFilesFolders = false
+                }
+            )
+
+        } else if (
             selectedTab == AppTab.Settings
         ) {
 
@@ -192,6 +242,14 @@ private fun MusiFlacApp(
 
                 onExtensions = {
                     showExtensions = true
+                },
+
+                onScanning = {
+                    showScanning = true
+                },
+
+                onFilesAndFolders = {
+                    showFilesFolders = true
                 },
 
                 onBack = {
@@ -291,7 +349,8 @@ private fun MusiFlacApp(
                                 extensionManager,
                             musicPlayer =
                                 musicPlayer,
-                            paddingValues = innerPadding
+                            paddingValues = innerPadding,
+                            onDownloadComplete = onDownloadComplete
                         )
                     }
 
@@ -327,6 +386,18 @@ class MainActivity : ComponentActivity() {
 
     private var currentTrack =
         mutableStateOf<MusicTrack?>(null)
+
+    private var rescanResultCount =
+        mutableStateOf<Int?>(null)
+
+    private var deepScanning =
+        mutableStateOf(false)
+
+    private var deepFoundCount =
+        mutableStateOf(0)
+
+    private var deepTotalCount =
+        mutableStateOf(0)
 
     private lateinit var musicPlayer: MusicPlayer
 
@@ -476,7 +547,7 @@ class MainActivity : ComponentActivity() {
                 Manifest.permission.READ_MEDIA_AUDIO
             )
 
-        } else {
+        } else if (shouldRescanOnLaunch()) {
 
             scanMusic()
         }
@@ -510,21 +581,99 @@ class MainActivity : ComponentActivity() {
                     musicPlayer.play(
                         track
                     )
+                },
+
+                onDownloadComplete = {
+                    scanMusic(showResult = false)
+                },
+
+                onRescan = {
+                    scanMusic(showResult = true)
+                },
+
+                onDeepRescan = {
+                    deepScanMusic()
+                },
+
+                rescanResultCount =
+                    rescanResultCount.value,
+
+                deepScanning =
+                    deepScanning.value,
+
+                deepFoundCount =
+                    deepFoundCount.value,
+
+                deepTotalCount =
+                    deepTotalCount.value,
+
+                onDismissScanResult = {
+                    rescanResultCount.value = null
                 }
             )
         }
     }
 
-    private fun scanMusic() {
+    private fun scanMusic(showResult: Boolean = false) {
+        Thread {
+            val scanner = MusicScanner(this)
+            val tracks = scanner.scan()
 
-        val scanner =
-            MusicScanner(this)
+            runOnUiThread {
+                musicTracks.value = tracks
+                if (showResult) {
+                    rescanResultCount.value = tracks.size
+                }
 
-        val tracks =
-            scanner.scan()
+                Log.d(
+                    "MusiFlacScanner",
+                    "Music scan completed: ${tracks.size} tracks found"
+                )
+            }
+        }.start()
+    }
 
-        musicTracks.value =
-            tracks
+    private fun deepScanMusic() {
+        if (deepScanning.value) return
+
+        deepScanning.value = true
+        deepFoundCount.value = 0
+        deepTotalCount.value = 0
+        rescanResultCount.value = null
+
+        Thread {
+            val scanner = MusicScanner(this)
+            val tracks = scanner.scanWithProgress { found, total ->
+                runOnUiThread {
+                    deepFoundCount.value = found
+                    deepTotalCount.value = total
+                }
+            }
+
+            runOnUiThread {
+                musicTracks.value = tracks
+                deepFoundCount.value = tracks.size
+                deepTotalCount.value = tracks.size
+                deepScanning.value = false
+                rescanResultCount.value = tracks.size
+
+                Log.d(
+                    "MusiFlacScanner",
+                    "Deep music scan completed: ${tracks.size} tracks found"
+                )
+            }
+        }.start()
+    }
+
+    private fun shouldRescanOnLaunch(): Boolean {
+
+        return getSharedPreferences(
+            "scanning_settings",
+            MODE_PRIVATE
+        ).getBoolean(
+            "rescan_on_launch",
+            true
+        )
     }
 
     override fun onDestroy() {
@@ -557,265 +706,6 @@ private fun PlaceholderScreen(
         Text(
             text = title
         )
-    }
-}
-
-@Composable
-private fun LibraryScreen(
-    musicTracks: List<MusicTrack>,
-    paddingValues: PaddingValues,
-    onTrackSelected: (MusicTrack) -> Unit
-) {
-    LazyColumn(
-
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(
-                paddingValues
-            ),
-
-        contentPadding =
-            PaddingValues(
-                start = 16.dp,
-                end = 16.dp,
-                top = 20.dp,
-                bottom = 20.dp
-            )
-    ) {
-
-        item {
-
-            Text(
-                text = "Library",
-
-                fontSize = 28.sp
-            )
-
-            Text(
-                text =
-                    "${musicTracks.size} songs",
-
-                color =
-                    Color(0xFF888888),
-
-                fontSize = 14.sp,
-
-                modifier =
-                    Modifier.padding(
-                        top = 4.dp
-                    )
-            )
-
-            Spacer(
-                modifier =
-                    Modifier.height(18.dp)
-            )
-        }
-
-        items(
-
-            items = musicTracks,
-
-            key = { track ->
-                track.id
-            }
-
-        ) { track ->
-
-            SongItem(
-
-                track = track,
-
-                onClick = {
-                    onTrackSelected(
-                        track
-                    )
-                }
-            )
-
-            Spacer(
-                modifier =
-                    Modifier.height(6.dp)
-            )
-        }
-    }
-}
-
-@Composable
-private fun SongItem(
-    track: MusicTrack,
-    onClick: () -> Unit
-) {
-    Row(
-
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(
-                RoundedCornerShape(12.dp)
-            )
-            .clickable(
-                onClick = onClick
-            )
-            .background(
-                Color(0xFF1E1E1E)
-            )
-            .padding(
-                horizontal = 12.dp,
-                vertical = 10.dp
-            ),
-
-        verticalAlignment =
-            Alignment.CenterVertically
-    ) {
-
-        AlbumArtwork(
-            artworkUri =
-                track.artworkUri
-        )
-
-        Spacer(
-            modifier =
-                Modifier.width(14.dp)
-        )
-
-        Column(
-            modifier =
-                Modifier
-                    .weight(1f)
-                    .background(
-                        Color.Transparent
-                    )
-        ) {
-
-            Text(
-                text = track.title,
-
-                color = Color.White,
-
-                fontSize = 16.sp,
-
-                maxLines = 1
-            )
-
-            Text(
-                text = track.artist,
-
-                color =
-                    Color(0xFFAAAAAA),
-
-                fontSize = 14.sp,
-
-                maxLines = 1,
-
-                modifier =
-                    Modifier.padding(
-                        top = 3.dp
-                    )
-            )
-
-            Text(
-                text = track.album,
-
-                color =
-                    Color(0xFF777777),
-
-                fontSize = 12.sp,
-
-                maxLines = 1,
-
-                modifier =
-                    Modifier.padding(
-                        top = 2.dp
-                    )
-            )
-        }
-
-        Text(
-            text =
-                formatDuration(
-                    track.duration
-                ),
-
-            color =
-                Color(0xFF888888),
-
-            fontSize = 12.sp,
-
-            modifier =
-                Modifier.padding(
-                    horizontal = 6.dp
-                )
-        )
-
-        Box(
-
-            modifier =
-                Modifier.size(40.dp),
-
-            contentAlignment =
-                Alignment.Center
-        ) {
-
-            Text(
-                text = "⋮",
-
-                color =
-                    Color.White,
-
-                fontSize = 24.sp
-            )
-        }
-    }
-}
-
-@Composable
-private fun AlbumArtwork(
-    artworkUri: String?
-) {
-    Box(
-
-        modifier = Modifier
-            .size(56.dp)
-            .clip(
-                RoundedCornerShape(8.dp)
-            )
-            .background(
-                Color(0xFF303030)
-            ),
-
-        contentAlignment =
-            Alignment.Center
-    ) {
-
-        if (artworkUri != null) {
-
-            AsyncImage(
-
-                model =
-                    artworkUri,
-
-                contentDescription =
-                    "Album artwork",
-
-                modifier =
-                    Modifier.fillMaxSize(),
-
-                contentScale =
-                    ContentScale.Crop
-            )
-
-        } else {
-
-            Text(
-
-                text = "♫",
-
-                color =
-                    Color(0xFF888888),
-
-                fontSize = 24.sp
-            )
-        }
     }
 }
 

@@ -63,6 +63,8 @@ fun SettingsScreen(
     selectedTheme: ThemeOption,
     onThemeSelected: (ThemeOption) -> Unit,
     onExtensions: () -> Unit,
+    onScanning: () -> Unit,
+    onFilesAndFolders: () -> Unit,
     onBack: () -> Unit
 ) {
 
@@ -238,7 +240,7 @@ fun SettingsScreen(
             description = "Configure music library scanning",
             icon = "⌕",
             onClick = {
-                // Scanning screen coming later
+                onScanning()
             }
         )
 
@@ -266,7 +268,7 @@ fun SettingsScreen(
             description = "Download location, filename, folder structure",
             icon = "□",
             onClick = {
-                // Files & Folders screen coming later
+                onFilesAndFolders()
             }
         )
 

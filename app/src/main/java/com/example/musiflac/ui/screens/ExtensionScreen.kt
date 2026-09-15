@@ -93,6 +93,9 @@ fun ExtensionScreen(
     extensionManager: ExtensionManager,
     onBack: () -> Unit
 ) {
+    // ExtensionManager exposes a SnapshotStateList, so this read is live.
+    // Installing/removing/toggling an extension mutates that list and Compose
+    // automatically recomposes this screen and any provider UI using it.
     val extensions =
         extensionManager.getAll()
 
@@ -672,8 +675,48 @@ fun ExtensionScreen(
                                 entry
                             )
 
+                            val extensionDirectory =
+                                File(
+                                    context.filesDir,
+                                    "extensions"
+                                )
+
+                            val installedPackage =
+                                extensionDirectory
+                                    .listFiles()
+                                    ?.firstOrNull { file ->
+                                        file.isFile &&
+                                                file.name.startsWith("${entry.id}-") &&
+                                                file.name.endsWith(".sflx", ignoreCase = true)
+                                    }
+
+                            if (installedPackage == null) {
+                                throw IllegalStateException(
+                                    "Installed extension package was not found."
+                                )
+                            }
+
+                            // The Kotlin manager and the Go/Goja runtime are both
+                            // initialized during app startup. Installing a package
+                            // after startup therefore requires registering it with
+                            // both live systems instead of waiting for a restart.
+                            val runtimeLoadResult =
+                                withContext(Dispatchers.IO) {
+                                    com.laizycoder.musiflac.online.GoBackend.loadExtension(
+                                        installedPackage.absolutePath
+                                    )
+                                }
+
+                            if (runtimeLoadResult.isBlank()) {
+                                throw IllegalStateException(
+                                    "Extension runtime did not load the installed package."
+                                )
+                            }
+
+                            extensionManager.refreshInstalledExtensions()
+
                             installMessage =
-                                "${entry.displayName} installed successfully."
+                                "${entry.displayName} installed and activated."
 
                         } catch (
                             error: Exception

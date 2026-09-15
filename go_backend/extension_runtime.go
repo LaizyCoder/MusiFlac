@@ -1,1808 +1,816 @@
 package gobackend
 
 import (
-	"archive/zip"
-	"bytes"
-	"encoding/json"
+	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"fmt"
-	"io"
+	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
-	"os"
-	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"crypto/hmac"
-	"crypto/md5"
-	"crypto/rand"
-	"crypto/sha1"
-	"crypto/sha256"
-	"encoding/base64"
 	"github.com/dop251/goja"
-	"github.com/dop251/goja_nodejs/eventloop"
-	"math/big"
 )
 
-type extensionManifest struct {
-	Name        string   `json:"name"`
-	DisplayName string   `json:"displayName"`
-	Version     string   `json:"version"`
-	Description string   `json:"description"`
-	Type        []string `json:"type"`
-	Permissions struct {
-		Network []string `json:"network"`
-	} `json:"permissions"`
+// allowPrivateNetworkAccess, when enabled, disables the SSRF guard that blocks
+// requests resolving to private/local/loopback addresses. This is opt-in and
+// intended for users who route the app's traffic through a local proxy or
+// custom DNS (e.g. a local mirror of api.zarz.moe). Disabled by default.
+var allowPrivateNetworkAccess atomic.Bool
+
+// SetAllowPrivateNetwork toggles whether extensions and built-in network code
+// are permitted to reach private/local network targets. Exposed to the Flutter
+// layer via the platform bridge.
+func SetAllowPrivateNetwork(allowed bool) {
+	allowPrivateNetworkAccess.Store(allowed)
+	if allowed {
+		GoLog("[HTTP] Private/local network access ENABLED (SSRF guard relaxed)\n")
+	} else {
+		GoLog("[HTTP] Private/local network access disabled (default)\n")
+	}
 }
 
-type loadedExtension struct {
-	ID         string
-	Manifest   extensionManifest
-	Runtime    *goja.Runtime
-	Provider   *goja.Object
-	Client     *http.Client
-	EventLoop  *eventloop.EventLoop
-	StorageDir string
+// IsPrivateNetworkAllowed reports the current state of the private-network guard.
+func IsPrivateNetworkAllowed() bool {
+	return allowPrivateNetworkAccess.Load()
 }
+
+const DefaultJSTimeout = 30 * time.Second
 
 var (
-	extensionsMu sync.RWMutex
-	extensions   = make(map[string]*loadedExtension)
+	extensionAuthState   = make(map[string]*ExtensionAuthState)
+	extensionAuthStateMu sync.RWMutex
 )
 
-func LoadExtension(packagePath string) (string, error) {
-	manifestBytes, scriptBytes, err := readExtensionPackage(packagePath)
-	if err != nil {
-		return "", err
+type ExtensionAuthState struct {
+	PendingAuthURL  string
+	AuthCode        string
+	AccessToken     string
+	RefreshToken    string
+	ExpiresAt       time.Time
+	IsAuthenticated bool
+	PKCEVerifier    string
+	PKCEChallenge   string
+}
+
+type PendingAuthRequest struct {
+	ExtensionID string
+	AuthURL     string
+	CallbackURL string
+	State       string
+	CreatedAt   time.Time
+}
+
+// Challenge URLs are short-lived; serving one past this age sends the user
+// to an already-expired verification page.
+const pendingAuthRequestTTL = 3 * time.Minute
+
+var (
+	pendingAuthRequests   = make(map[string]*PendingAuthRequest)
+	pendingAuthStates     = make(map[string]string)
+	pendingAuthRequestsMu sync.RWMutex
+)
+
+func newExtensionCallbackState() (string, error) {
+	random := make([]byte, 32)
+	if _, err := rand.Read(random); err != nil {
+		return "", fmt.Errorf("generate callback state: %w", err)
 	}
+	return base64.RawURLEncoding.EncodeToString(random), nil
+}
 
-	var manifest extensionManifest
-
-	if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
-		return "", fmt.Errorf(
-			"invalid manifest.json: %w",
-			err,
-		)
+func registerPendingAuthRequest(request *PendingAuthRequest) error {
+	if request == nil || strings.TrimSpace(request.ExtensionID) == "" {
+		return fmt.Errorf("extension id is required")
 	}
-
-	if manifest.Name == "" {
-		return "", fmt.Errorf(
-			"extension manifest is missing name",
-		)
-	}
-
-	if manifest.Version == "" {
-		return "", fmt.Errorf(
-			"extension manifest is missing version",
-		)
-	}
-
-	storageDir := filepath.Join(
-		filepath.Dir(packagePath),
-		"storage",
-	)
-
-	if err := os.MkdirAll(storageDir, 0o755); err != nil {
-		return "", fmt.Errorf(
-			"unable to create extension storage directory: %w",
-			err,
-		)
-	}
-
-	storageFile := filepath.Join(
-		storageDir,
-		manifest.Name+".json",
-	)
-
-	storageData := make(map[string]interface{})
-
-	if data, readErr := os.ReadFile(storageFile); readErr == nil {
-		if len(data) > 0 {
-			if err := json.Unmarshal(data, &storageData); err != nil {
-				storageData = make(map[string]interface{})
-			}
-		}
-	} else if !os.IsNotExist(readErr) {
-		return "", fmt.Errorf(
-			"unable to read extension storage: %w",
-			readErr,
-		)
-	}
-
-	storageMu := sync.Mutex{}
-
-	eventLoop := eventloop.NewEventLoop()
-
-	var runtime *goja.Runtime
-	var registeredProvider *goja.Object
-
-	var httpClient *http.Client
-
-	eventLoop.Run(func(vm *goja.Runtime) {
-		runtime = vm
-
-		/*
-		 * Each extension gets its own HTTP cookie jar.
-		 */
-		cookieJar, err := newCookieJar()
+	if request.State == "" {
+		state, err := newExtensionCallbackState()
 		if err != nil {
-			panic(
-				runtime.ToValue(
-					fmt.Sprintf(
-						"unable to create HTTP cookie jar: %v",
-						err,
-					),
-				),
-			)
+			return err
 		}
-
-		httpClient = &http.Client{
-			Jar: cookieJar,
-
-			/*
-			 * SpotiFLAC follows redirects automatically.
-			 * Go's HTTP client already handles the standard
-			 * 301/302/303/307/308 redirect behavior.
-			 */
-			CheckRedirect: func(
-				request *http.Request,
-				via []*http.Request,
-			) error {
-
-				if len(via) >= 10 {
-					return fmt.Errorf(
-						"too many HTTP redirects",
-					)
-				}
-
-				return nil
-			},
-
-			Timeout: 30 * time.Second,
-		}
-
-		/*
-		 * ---------------------------------------------------------
-		 * Logging API
-		 * ---------------------------------------------------------
-		 */
-
-		logObject := runtime.NewObject()
-
-		logObject.Set(
-			"debug",
-			func(call goja.FunctionCall) goja.Value {
-				fmt.Printf(
-					"[MusiFlac Extension][DEBUG] %s: %s\n",
-					manifest.Name,
-					formatLogArguments(call.Arguments),
-				)
-
-				return goja.Undefined()
-			},
-		)
-
-		logObject.Set(
-			"info",
-			func(call goja.FunctionCall) goja.Value {
-				fmt.Printf(
-					"[MusiFlac Extension][INFO] %s: %s\n",
-					manifest.Name,
-					formatLogArguments(call.Arguments),
-				)
-
-				return goja.Undefined()
-			},
-		)
-
-		logObject.Set(
-			"warn",
-			func(call goja.FunctionCall) goja.Value {
-				fmt.Printf(
-					"[MusiFlac Extension][WARN] %s: %s\n",
-					manifest.Name,
-					formatLogArguments(call.Arguments),
-				)
-
-				return goja.Undefined()
-			},
-		)
-
-		logObject.Set(
-			"error",
-			func(call goja.FunctionCall) goja.Value {
-				fmt.Printf(
-					"[MusiFlac Extension][ERROR] %s: %s\n",
-					manifest.Name,
-					formatLogArguments(call.Arguments),
-				)
-
-				return goja.Undefined()
-			},
-		)
-
-		runtime.Set(
-			"log",
-			logObject,
-		)
-
-		/*
-		 * ---------------------------------------------------------
-		 * Console compatibility
-		 * ---------------------------------------------------------
-		 */
-
-		consoleObject := runtime.NewObject()
-
-		consoleObject.Set(
-			"log",
-			func(call goja.FunctionCall) goja.Value {
-				fmt.Printf(
-					"[MusiFlac Extension][LOG] %s: %s\n",
-					manifest.Name,
-					formatLogArguments(call.Arguments),
-				)
-
-				return goja.Undefined()
-			},
-		)
-
-		consoleObject.Set(
-			"debug",
-			func(call goja.FunctionCall) goja.Value {
-				fmt.Printf(
-					"[MusiFlac Extension][DEBUG] %s: %s\n",
-					manifest.Name,
-					formatLogArguments(call.Arguments),
-				)
-
-				return goja.Undefined()
-			},
-		)
-
-		consoleObject.Set(
-			"info",
-			func(call goja.FunctionCall) goja.Value {
-				fmt.Printf(
-					"[MusiFlac Extension][INFO] %s: %s\n",
-					manifest.Name,
-					formatLogArguments(call.Arguments),
-				)
-
-				return goja.Undefined()
-			},
-		)
-
-		consoleObject.Set(
-			"warn",
-			func(call goja.FunctionCall) goja.Value {
-				fmt.Printf(
-					"[MusiFlac Extension][WARN] %s: %s\n",
-					manifest.Name,
-					formatLogArguments(call.Arguments),
-				)
-
-				return goja.Undefined()
-			},
-		)
-
-		consoleObject.Set(
-			"error",
-			func(call goja.FunctionCall) goja.Value {
-				fmt.Printf(
-					"[MusiFlac Extension][ERROR] %s: %s\n",
-					manifest.Name,
-					formatLogArguments(call.Arguments),
-				)
-
-				return goja.Undefined()
-			},
-		)
-
-		runtime.Set(
-			"console",
-			consoleObject,
-		)
-
-		/*
-		 * ---------------------------------------------------------
-		 * HTTP API
-		 * ---------------------------------------------------------
-		 */
-
-		storageObject := runtime.NewObject()
-
-		storageObject.Set(
-			"get",
-			func(call goja.FunctionCall) goja.Value {
-
-				if len(call.Arguments) == 0 {
-					return goja.Null()
-				}
-
-				key := call.Argument(0).String()
-
-				storageMu.Lock()
-				value, exists := storageData[key]
-				storageMu.Unlock()
-
-				if !exists {
-					return goja.Null()
-				}
-
-				return runtime.ToValue(value)
-			},
-		)
-
-		storageObject.Set(
-			"set",
-			func(call goja.FunctionCall) goja.Value {
-
-				if len(call.Arguments) < 2 {
-					panic(
-						runtime.ToValue(
-							"storage.set requires key and value",
-						),
-					)
-				}
-
-				key := call.Argument(0).String()
-				value := call.Argument(1).Export()
-
-				storageMu.Lock()
-
-				storageData[key] = value
-				data, err := json.Marshal(storageData)
-
-				if err == nil {
-					err = os.WriteFile(
-						storageFile,
-						data,
-						0o600,
-					)
-				}
-
-				storageMu.Unlock()
-
-				if err != nil {
-					panic(
-						runtime.ToValue(
-							fmt.Sprintf(
-								"storage.set failed: %v",
-								err,
-							),
-						),
-					)
-				}
-
-				return goja.Undefined()
-			},
-		)
-
-		storageObject.Set(
-			"remove",
-			func(call goja.FunctionCall) goja.Value {
-
-				if len(call.Arguments) == 0 {
-					return goja.Undefined()
-				}
-
-				key := call.Argument(0).String()
-
-				storageMu.Lock()
-
-				delete(storageData, key)
-				data, err := json.Marshal(storageData)
-
-				if err == nil {
-					err = os.WriteFile(
-						storageFile,
-						data,
-						0o600,
-					)
-				}
-
-				storageMu.Unlock()
-
-				if err != nil {
-					panic(
-						runtime.ToValue(
-							fmt.Sprintf(
-								"storage.remove failed: %v",
-								err,
-							),
-						),
-					)
-				}
-
-				return goja.Undefined()
-			},
-		)
-
-		runtime.Set(
-			"storage",
-			storageObject,
-		)
-
-		httpObject := runtime.NewObject()
-
-		httpObject.Set(
-			"get",
-			func(call goja.FunctionCall) goja.Value {
-				return executeHTTPFromCall(
-					runtime,
-					&manifest,
-					httpClient,
-					"GET",
-					call,
-				)
-			},
-		)
-
-		httpObject.Set(
-			"post",
-			func(call goja.FunctionCall) goja.Value {
-				return executeHTTPFromCall(
-					runtime,
-					&manifest,
-					httpClient,
-					"POST",
-					call,
-				)
-			},
-		)
-
-		httpObject.Set(
-			"put",
-			func(call goja.FunctionCall) goja.Value {
-				return executeHTTPFromCall(
-					runtime,
-					&manifest,
-					httpClient,
-					"PUT",
-					call,
-				)
-			},
-		)
-
-		httpObject.Set(
-			"delete",
-			func(call goja.FunctionCall) goja.Value {
-				return executeHTTPFromCall(
-					runtime,
-					&manifest,
-					httpClient,
-					"DELETE",
-					call,
-				)
-			},
-		)
-
-		httpObject.Set(
-			"patch",
-			func(call goja.FunctionCall) goja.Value {
-				return executeHTTPFromCall(
-					runtime,
-					&manifest,
-					httpClient,
-					"PATCH",
-					call,
-				)
-			},
-		)
-
-		httpObject.Set(
-			"request",
-			func(call goja.FunctionCall) goja.Value {
-				return executeGenericHTTPFromCall(
-					runtime,
-					&manifest,
-					httpClient,
-					call,
-				)
-			},
-		)
-
-		httpObject.Set(
-			"clearCookies",
-			func(call goja.FunctionCall) goja.Value {
-				newJar, err := newCookieJar()
-
-				if err != nil {
-					panic(
-						runtime.ToValue(
-							fmt.Sprintf(
-								"unable to clear cookies: %v",
-								err,
-							),
-						),
-					)
-				}
-
-				httpClient.Jar = newJar
-
-				return goja.Undefined()
-			},
-		)
-
-		runtime.Set(
-			"http",
-			httpObject,
-		)
-
-		/*
-		 * ---------------------------------------------------------
-		 * Generic utility API
-		 * ---------------------------------------------------------
-		 */
-
-		utilsObject := runtime.NewObject()
-
-		utilsObject.Set(
-
-			"randomUserAgent",
-
-			func(call goja.FunctionCall) goja.Value {
-
-				userAgents := []string{
-
-					"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-
-					"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-
-					"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-
-					"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
-				}
-
-				index, err := rand.Int(
-
-					rand.Reader,
-
-					big.NewInt(int64(len(userAgents))),
-				)
-
-				if err != nil {
-
-					return runtime.ToValue(userAgents[0])
-
-				}
-
-				return runtime.ToValue(
-
-					userAgents[index.Int64()],
-				)
-
-			},
-		)
-
-		utilsObject.Set(
-			"parseJSON",
-			func(call goja.FunctionCall) goja.Value {
-
-				if len(call.Arguments) == 0 {
-					panic("utils.parseJSON requires a string")
-				}
-
-				var value interface{}
-
-				if err := json.Unmarshal(
-					[]byte(call.Argument(0).String()),
-					&value,
-				); err != nil {
-					panic(
-						runtime.ToValue(
-							fmt.Sprintf(
-								"invalid JSON: %v",
-								err,
-							),
-						),
-					)
-				}
-
-				return runtime.ToValue(value)
-			},
-		)
-
-		utilsObject.Set(
-			"stringifyJSON",
-			func(call goja.FunctionCall) goja.Value {
-
-				if len(call.Arguments) == 0 {
-					return runtime.ToValue("null")
-				}
-
-				data, err := json.Marshal(
-					call.Argument(0).Export(),
-				)
-
-				if err != nil {
-					panic(
-						runtime.ToValue(
-							fmt.Sprintf(
-								"unable to stringify JSON: %v",
-								err,
-							),
-						),
-					)
-				}
-
-				return runtime.ToValue(string(data))
-			},
-		)
-
-		utilsObject.Set(
-			"base64Encode",
-			func(call goja.FunctionCall) goja.Value {
-
-				if len(call.Arguments) == 0 {
-					return runtime.ToValue("")
-				}
-
-				return runtime.ToValue(
-					base64.StdEncoding.EncodeToString(
-						[]byte(call.Argument(0).String()),
-					),
-				)
-			},
-		)
-
-		utilsObject.Set(
-			"base64Decode",
-			func(call goja.FunctionCall) goja.Value {
-
-				if len(call.Arguments) == 0 {
-					return runtime.ToValue("")
-				}
-
-				decoded, err :=
-					base64.StdEncoding.DecodeString(
-						call.Argument(0).String(),
-					)
-
-				if err != nil {
-					panic(
-						runtime.ToValue(
-							fmt.Sprintf(
-								"invalid base64: %v",
-								err,
-							),
-						),
-					)
-				}
-
-				return runtime.ToValue(string(decoded))
-			},
-		)
-
-		utilsObject.Set(
-			"md5",
-			func(call goja.FunctionCall) goja.Value {
-
-				if len(call.Arguments) == 0 {
-					return runtime.ToValue("")
-				}
-
-				digest := md5.Sum(
-					[]byte(call.Argument(0).String()),
-				)
-
-				return runtime.ToValue(
-					fmt.Sprintf("%x", digest),
-				)
-			},
-		)
-
-		utilsObject.Set(
-			"sha256",
-			func(call goja.FunctionCall) goja.Value {
-
-				if len(call.Arguments) == 0 {
-					return runtime.ToValue("")
-				}
-
-				digest := sha256.Sum256(
-					[]byte(call.Argument(0).String()),
-				)
-
-				return runtime.ToValue(
-					fmt.Sprintf("%x", digest),
-				)
-			},
-		)
-
-		utilsObject.Set(
-			"hmacSHA256",
-			func(call goja.FunctionCall) goja.Value {
-
-				if len(call.Arguments) < 2 {
-					panic(
-						"utils.hmacSHA256 requires message and secret",
-					)
-				}
-
-				mac := hmac.New(
-					sha256.New,
-					[]byte(call.Argument(1).String()),
-				)
-
-				_, _ = mac.Write(
-					[]byte(call.Argument(0).String()),
-				)
-
-				return runtime.ToValue(
-					fmt.Sprintf("%x", mac.Sum(nil)),
-				)
-			},
-		)
-
-		utilsObject.Set(
-			"hmacSHA256Base64",
-			func(call goja.FunctionCall) goja.Value {
-
-				if len(call.Arguments) < 2 {
-					panic(
-						"utils.hmacSHA256Base64 requires message and secret",
-					)
-				}
-
-				mac := hmac.New(
-					sha256.New,
-					[]byte(call.Argument(1).String()),
-				)
-
-				_, _ = mac.Write(
-					[]byte(call.Argument(0).String()),
-				)
-
-				return runtime.ToValue(
-					base64.StdEncoding.EncodeToString(
-						mac.Sum(nil),
-					),
-				)
-			},
-		)
-
-		utilsObject.Set(
-			"hmacSHA1",
-			func(call goja.FunctionCall) goja.Value {
-
-				if len(call.Arguments) < 2 {
-					panic(
-						"utils.hmacSHA1 requires message and secret",
-					)
-				}
-
-				message := exportByteArray(
-					runtime,
-					call.Argument(1),
-				)
-
-				secret := exportByteArray(
-					runtime,
-					call.Argument(0),
-				)
-
-				mac := hmac.New(
-					sha1.New,
-					secret,
-				)
-
-				_, _ = mac.Write(message)
-
-				digest := mac.Sum(nil)
-
-				result := make([]interface{}, len(digest))
-
-				for index, value := range digest {
-					result[index] = int(value)
-				}
-
-				return runtime.ToValue(result)
-			},
-		)
-
-		runtime.Set(
-			"utils",
-			utilsObject,
-		)
-
-		/*
-		 * ---------------------------------------------------------
-		 * Extension registration API
-		 * ---------------------------------------------------------
-		 */
-
-		runtime.Set(
-			"registerExtension",
-			func(call goja.FunctionCall) goja.Value {
-
-				if len(call.Arguments) == 0 {
-					panic(
-						"registerExtension requires an object",
-					)
-				}
-
-				registeredProvider =
-					call.Argument(0).ToObject(runtime)
-
-				return goja.Undefined()
-			},
-		)
-
-		/*
-		 * ---------------------------------------------------------
-		 * Execute extension JavaScript
-		 * ---------------------------------------------------------
-		 */
-
-		_, err = runtime.RunScript(
-			manifest.Name,
-			string(scriptBytes),
-		)
-	})
-
-	if err != nil {
-		return "", fmt.Errorf(
-			"extension JavaScript failed: %w",
-			err,
-		)
+		request.State = state
+	}
+	if request.CreatedAt.IsZero() {
+		request.CreatedAt = time.Now()
 	}
 
-	if registeredProvider == nil {
-		return "", fmt.Errorf(
-			"extension did not call registerExtension()",
-		)
-	}
-
-	eventLoop.Start()
-
-	loaded := &loadedExtension{
-		ID:         manifest.Name,
-		Manifest:   manifest,
-		Runtime:    runtime,
-		Provider:   registeredProvider,
-		Client:     httpClient,
-		EventLoop:  eventLoop,
-		StorageDir: storageDir,
-	}
-
-	extensionsMu.Lock()
-
-	extensions[manifest.Name] = loaded
-
-	extensionsMu.Unlock()
-
-	return manifestJSON(manifest)
-}
-
-/*
- * -------------------------------------------------------------
- * HTTP helpers
- * -------------------------------------------------------------
- */
-
-func executeHTTPFromCall(
-	runtime *goja.Runtime,
-	manifest *extensionManifest,
-	client *http.Client,
-	method string,
-	call goja.FunctionCall,
-) goja.Value {
-
-	if len(call.Arguments) == 0 {
-		panic(
-			runtime.ToValue(
-				"http request requires a URL",
-			),
-		)
-	}
-
-	requestURL :=
-		call.Argument(0).String()
-
-	var headers map[string]string
-
-	if len(call.Arguments) >= 2 &&
-		call.Argument(1) != nil &&
-		call.Argument(1) != goja.Undefined() {
-
-		headers = exportHeaders(
-			runtime,
-			call.Argument(1),
-		)
-	}
-
-	var body interface{}
-
-	if method != "GET" &&
-		method != "DELETE" &&
-		len(call.Arguments) >= 2 {
-
-		/*
-		 * For POST/PUT/PATCH:
-		 *
-		 *   http.post(url, body, headers)
-		 *
-		 * The second argument is the body and the
-		 * third argument is the headers.
-		 */
-		bodyValue :=
-			call.Argument(1)
-
-		if len(call.Arguments) >= 3 {
-			headers =
-				exportHeaders(
-					runtime,
-					call.Argument(2),
-				)
-		}
-
-		body =
-			exportRequestBody(
-				runtime,
-				bodyValue,
-			)
-	}
-
-	response, err :=
-		executeHTTP(
-			manifest,
-			client,
-			method,
-			requestURL,
-			headers,
-			body,
-		)
-
-	if err != nil {
-		panic(
-			runtime.ToValue(
-				err.Error(),
-			),
-		)
-	}
-
-	return runtime.ToValue(response)
-}
-
-func executeGenericHTTPFromCall(
-	runtime *goja.Runtime,
-	manifest *extensionManifest,
-	client *http.Client,
-	call goja.FunctionCall,
-) goja.Value {
-
-	if len(call.Arguments) < 2 {
-		panic(
-			runtime.ToValue(
-				"http.request requires URL and options",
-			),
-		)
-	}
-
-	requestURL :=
-		call.Argument(0).String()
-
-	options :=
-		call.Argument(1).ToObject(runtime)
-
-	methodValue :=
-		options.Get("method")
-
-	method := "GET"
-
-	if methodValue != nil &&
-		methodValue != goja.Undefined() {
-
-		method =
-			strings.ToUpper(
-				methodValue.String(),
-			)
-	}
-
-	headers := map[string]string{}
-
-	headersValue :=
-		options.Get("headers")
-
-	if headersValue != nil &&
-		headersValue != goja.Undefined() {
-
-		headers =
-			exportHeaders(
-				runtime,
-				headersValue,
-			)
-	}
-
-	var body interface{}
-
-	bodyValue :=
-		options.Get("body")
-
-	if bodyValue != nil &&
-		bodyValue != goja.Undefined() {
-
-		body =
-			exportRequestBody(
-				runtime,
-				bodyValue,
-			)
-	}
-
-	response, err :=
-		executeHTTP(
-			manifest,
-			client,
-			method,
-			requestURL,
-			headers,
-			body,
-		)
-
-	if err != nil {
-		panic(
-			runtime.ToValue(
-				err.Error(),
-			),
-		)
-	}
-
-	return runtime.ToValue(response)
-}
-
-func executeHTTP(
-	manifest *extensionManifest,
-	client *http.Client,
-	method string,
-	requestURL string,
-	headers map[string]string,
-	body interface{},
-) (map[string]interface{}, error) {
-
-	if !networkPermissionAllowed(
-		manifest.Permissions.Network,
-		requestURL,
-	) {
-		return nil, fmt.Errorf(
-			"network access denied for %s",
-			requestURL,
-		)
-	}
-
-	var bodyReader io.Reader
-
-	if body != nil {
-
-		switch value := body.(type) {
-
-		case string:
-
-			bodyReader =
-				strings.NewReader(value)
-
-		case []byte:
-
-			bodyReader =
-				bytes.NewReader(value)
-
-		default:
-
-			data, err :=
-				json.Marshal(value)
-
-			if err != nil {
-				return nil, fmt.Errorf(
-					"unable to encode request body: %w",
-					err,
-				)
-			}
-
-			bodyReader =
-				bytes.NewReader(data)
-
-			if !hasHeader(
-				headers,
-				"Content-Type",
-			) {
-				if headers == nil {
-					headers = make(map[string]string)
-				}
-				headers["Content-Type"] =
-					"application/json"
-			}
+	pendingAuthRequestsMu.Lock()
+	if owner := pendingAuthStates[request.State]; owner != "" && owner != request.ExtensionID {
+		ownerRequest := pendingAuthRequests[owner]
+		sameChallenge := ownerRequest != nil &&
+			ownerRequest.State == request.State &&
+			ownerRequest.AuthURL == request.AuthURL &&
+			ownerRequest.CallbackURL == request.CallbackURL &&
+			ownerRequest.CreatedAt.Equal(request.CreatedAt)
+		if !sameChallenge {
+			pendingAuthRequestsMu.Unlock()
+			return fmt.Errorf("callback state is already registered")
 		}
 	}
-
-	request, err :=
-		http.NewRequest(
-			method,
-			requestURL,
-			bodyReader,
-		)
-
-	if err != nil {
-		return nil, fmt.Errorf(
-			"unable to create HTTP request: %w",
-			err,
-		)
+	if previous := pendingAuthRequests[request.ExtensionID]; previous != nil && previous.State != request.State {
+		removePendingAuthRequestLocked(request.ExtensionID)
 	}
-
-	if !hasHeader(
-		headers,
-		"User-Agent",
-	) {
-		request.Header.Set(
-			"User-Agent",
-			"MusiFlac/1.0",
-		)
+	pendingAuthRequests[request.ExtensionID] = request
+	if pendingAuthStates[request.State] == "" {
+		pendingAuthStates[request.State] = request.ExtensionID
 	}
-
-	for key, value := range headers {
-		request.Header.Set(
-			key,
-			value,
-		)
-	}
-
-	response, err :=
-		client.Do(request)
-
-	if err != nil {
-		return nil, fmt.Errorf(
-			"HTTP request failed: %w",
-			err,
-		)
-	}
-
-	defer response.Body.Close()
-
-	responseBody, err :=
-		io.ReadAll(
-			response.Body,
-		)
-
-	if err != nil {
-		return nil, fmt.Errorf(
-			"unable to read HTTP response: %w",
-			err,
-		)
-	}
-
-	responseHeaders :=
-		make(map[string]interface{})
-
-	for key, values := range response.Header {
-
-		if len(values) == 1 {
-
-			responseHeaders[key] =
-				values[0]
-
-		} else {
-
-			copied :=
-				make([]string, len(values))
-
-			copy(
-				copied,
-				values,
-			)
-
-			responseHeaders[key] =
-				copied
-		}
-	}
-
-	return map[string]interface{}{
-		"statusCode": response.StatusCode,
-		"status":     response.StatusCode,
-		"ok": response.StatusCode >= 200 &&
-			response.StatusCode < 300,
-		"body":    string(responseBody),
-		"headers": responseHeaders,
-	}, nil
+	pendingAuthRequestsMu.Unlock()
+	return nil
 }
 
-func exportByteArray(
-	runtime *goja.Runtime,
-	value goja.Value,
-) []byte {
-
-	if value == nil ||
-		value == goja.Undefined() ||
-		value == goja.Null() {
-		return nil
-	}
-
-	object := value.ToObject(runtime)
-
-	lengthValue := object.Get("length")
-
-	if lengthValue != nil &&
-		lengthValue != goja.Undefined() {
-
-		length := int(lengthValue.ToInteger())
-
-		if length >= 0 {
-			result := make([]byte, length)
-
-			for index := 0; index < length; index++ {
-				item := object.Get(
-					fmt.Sprintf("%d", index),
-				)
-
-				if item == nil ||
-					item == goja.Undefined() {
-					continue
-				}
-
-				number := int(item.ToInteger())
-
-				result[index] = byte(number & 0xff)
-			}
-
-			return result
-		}
-	}
-
-	return []byte(value.String())
-}
-
-func exportHeaders(
-	runtime *goja.Runtime,
-	value goja.Value,
-) map[string]string {
-
-	result := make(map[string]string)
-
-	object :=
-		value.ToObject(runtime)
-
-	if object == nil {
-		return result
-	}
-
-	for _, key := range object.Keys() {
-
-		headerValue :=
-			object.Get(key)
-
-		if headerValue == nil ||
-			headerValue == goja.Undefined() {
-			continue
-		}
-
-		result[key] =
-			headerValue.String()
-	}
-
-	return result
-}
-
-func exportRequestBody(
-	runtime *goja.Runtime,
-	value goja.Value,
-) interface{} {
-
-	if value == nil ||
-		value == goja.Undefined() {
-
-		return nil
-	}
-
-	if stringValue, ok :=
-		value.Export().(string); ok {
-
-		return stringValue
-	}
-
-	exported :=
-		value.Export()
-
-	/*
-	 * Keep primitive values as-is.
-	 */
-	switch exported.(type) {
-
-	case bool,
-		float64,
-		int,
-		int64,
-		nil:
-
-		return exported
-	}
-
-	/*
-	 * Objects/arrays are encoded later by executeHTTP.
-	 */
-	_ = runtime
-
-	return exported
-}
-
-func hasHeader(
-	headers map[string]string,
-	target string,
-) bool {
-
-	for key := range headers {
-
-		if strings.EqualFold(
-			key,
-			target,
-		) {
-			return true
-		}
-	}
-
-	return false
-}
-
-/*
- * -------------------------------------------------------------
- * Network permission matching
- * -------------------------------------------------------------
- */
-
-func networkPermissionAllowed(
-	permissions []string,
-	requestURL string,
-) bool {
-
-	parsed, err :=
-		url.Parse(requestURL)
-
-	if err != nil {
-		return false
-	}
-
-	hostname :=
-		strings.ToLower(
-			parsed.Hostname(),
-		)
-
-	if hostname == "" {
-		return false
-	}
-
-	for _, permission := range permissions {
-
-		permission =
-			strings.ToLower(
-				strings.TrimSpace(
-					permission,
-				),
-			)
-
-		if permission == "" {
-			continue
-		}
-
-		/*
-		 * Exact hostname.
-		 */
-		if permission == hostname {
-			return true
-		}
-
-		/*
-		 * Wildcard:
-		 *
-		 * *.spotify.com
-		 *
-		 * Matches:
-		 * api.spotify.com
-		 * open.spotify.com
-		 *
-		 * It does not match spotify.com itself.
-		 */
-		if strings.HasPrefix(
-			permission,
-			"*.",
-		) {
-
-			suffix :=
-				strings.TrimPrefix(
-					permission,
-					"*.",
-				)
-
-			if strings.HasSuffix(
-				hostname,
-				"."+suffix,
-			) {
-				return true
-			}
-		}
-	}
-
-	return false
-}
-
-/*
- * -------------------------------------------------------------
- * Cookie jar
- * -------------------------------------------------------------
- */
-
-type simpleCookieJar struct {
-	mu      sync.Mutex
-	cookies map[string][]*http.Cookie
-}
-
-func newCookieJar() (
-	http.CookieJar,
-	error,
-) {
-
-	return &simpleCookieJar{
-		cookies: make(
-			map[string][]*http.Cookie,
-		),
-	}, nil
-}
-
-func (jar *simpleCookieJar) Cookies(
-	requestURL *url.URL,
-) []*http.Cookie {
-
-	jar.mu.Lock()
-	defer jar.mu.Unlock()
-
-	host :=
-		requestURL.Hostname()
-
-	cookies :=
-		jar.cookies[host]
-
-	result :=
-		make([]*http.Cookie, 0)
-
-	for _, cookie := range cookies {
-
-		if cookie == nil {
-			continue
-		}
-
-		result =
-			append(
-				result,
-				cookie,
-			)
-	}
-
-	return result
-}
-
-func (jar *simpleCookieJar) SetCookies(
-	requestURL *url.URL,
-	cookies []*http.Cookie,
-) {
-
-	jar.mu.Lock()
-	defer jar.mu.Unlock()
-
-	host :=
-		requestURL.Hostname()
-
-	if len(cookies) == 0 {
+func removePendingAuthRequestLocked(extensionID string) {
+	request := pendingAuthRequests[extensionID]
+	delete(pendingAuthRequests, extensionID)
+	if request == nil || pendingAuthStates[request.State] != extensionID {
 		return
 	}
-
-	existing :=
-		jar.cookies[host]
-
-	for _, newCookie := range cookies {
-
-		if newCookie == nil {
-			continue
+	delete(pendingAuthStates, request.State)
+	for candidateID, candidate := range pendingAuthRequests {
+		if candidate != nil && candidate.State == request.State &&
+			time.Since(candidate.CreatedAt) < pendingAuthRequestTTL {
+			pendingAuthStates[request.State] = candidateID
+			return
 		}
+	}
+}
 
-		replaced := false
+func removePendingAuthStateLocked(state string) {
+	delete(pendingAuthStates, state)
+	for extensionID, request := range pendingAuthRequests {
+		if request != nil && request.State == state {
+			delete(pendingAuthRequests, extensionID)
+		}
+	}
+}
 
-		for index, oldCookie := range existing {
+func resolveExtensionCallbackStateLocked(state string) (string, error) {
+	extensionID := pendingAuthStates[state]
+	request := pendingAuthRequests[extensionID]
+	if extensionID == "" || request == nil || request.State != state ||
+		time.Since(request.CreatedAt) >= pendingAuthRequestTTL {
+		removePendingAuthStateLocked(state)
+		return "", fmt.Errorf("callback state is invalid, expired, or already used")
+	}
+	return extensionID, nil
+}
 
-			if oldCookie.Name ==
-				newCookie.Name {
+// ResolveExtensionCallbackState validates a callback nonce without consuming
+// it. Callback handlers use this before an exchange so a transient exchange
+// failure can still be retried with the same short-lived challenge.
+func ResolveExtensionCallbackState(state string) (string, error) {
+	state = strings.TrimSpace(state)
+	if state == "" {
+		return "", fmt.Errorf("callback state is required")
+	}
 
-				existing[index] =
-					newCookie
+	pendingAuthRequestsMu.Lock()
+	extensionID, err := resolveExtensionCallbackStateLocked(state)
+	pendingAuthRequestsMu.Unlock()
+	return extensionID, err
+}
 
-				replaced = true
+func ConsumeExtensionCallbackState(state string) (string, error) {
+	state = strings.TrimSpace(state)
+	if state == "" {
+		return "", fmt.Errorf("callback state is required")
+	}
 
-				break
+	pendingAuthRequestsMu.Lock()
+	extensionID, err := resolveExtensionCallbackStateLocked(state)
+	if err != nil {
+		pendingAuthRequestsMu.Unlock()
+		return "", err
+	}
+	removePendingAuthStateLocked(state)
+	pendingAuthRequestsMu.Unlock()
+	return extensionID, nil
+}
+
+func GetPendingAuthRequest(extensionID string) *PendingAuthRequest {
+	pendingAuthRequestsMu.RLock()
+	defer pendingAuthRequestsMu.RUnlock()
+	return pendingAuthRequests[extensionID]
+}
+
+func ClearPendingAuthRequest(extensionID string) {
+	pendingAuthRequestsMu.Lock()
+	defer pendingAuthRequestsMu.Unlock()
+	removePendingAuthRequestLocked(extensionID)
+}
+
+func SetExtensionAuthCode(extensionID string, authCode string) {
+	extensionAuthStateMu.Lock()
+	defer extensionAuthStateMu.Unlock()
+
+	state, exists := extensionAuthState[extensionID]
+	if !exists {
+		state = &ExtensionAuthState{}
+		extensionAuthState[extensionID] = state
+	}
+	state.AuthCode = authCode
+}
+
+func SetExtensionTokens(extensionID string, accessToken, refreshToken string, expiresAt time.Time) {
+	extensionAuthStateMu.Lock()
+	defer extensionAuthStateMu.Unlock()
+
+	state, exists := extensionAuthState[extensionID]
+	if !exists {
+		state = &ExtensionAuthState{}
+		extensionAuthState[extensionID] = state
+	}
+	state.AccessToken = accessToken
+	state.RefreshToken = refreshToken
+	state.ExpiresAt = expiresAt
+	state.IsAuthenticated = accessToken != ""
+}
+
+type extensionRuntime struct {
+	extensionID    string
+	manifest       *ExtensionManifest
+	settings       map[string]any
+	httpClient     *http.Client
+	downloadClient *http.Client
+	cookieJar      http.CookieJar
+	dataDir        string
+	vm             *goja.Runtime
+
+	activeDownloadMu     sync.RWMutex
+	activeDownloadItemID string
+
+	resolutionMu     sync.RWMutex
+	resolutionBudget *resolutionBudget
+
+	activeRequestMu sync.RWMutex
+	activeRequestID string
+
+	storageMu     sync.RWMutex
+	storageCache  map[string]any
+	storageClosed bool
+
+	credentialsMu    sync.RWMutex
+	credentialsCache map[string]any
+
+	// Set when a signed-session call inside the current script invocation
+	// required verification. The provider wrapper consumes it after the
+	// script returns, so verification surfaces even when the extension
+	// script swallowed the needsVerification response (issue: fallback
+	// skipped provider B's challenge and failed outright).
+	verificationMu          sync.Mutex
+	verificationRequiredURL string
+}
+
+func (r *extensionRuntime) noteVerificationRequired(authURL string) {
+	r.verificationMu.Lock()
+	if authURL == "" {
+		authURL = "pending"
+	}
+	r.verificationRequiredURL = authURL
+	r.verificationMu.Unlock()
+}
+
+// consumeVerificationRequired returns the noted auth URL (or "pending") and
+// clears the flag; "" means no verification was requested since the last
+// consume.
+func (r *extensionRuntime) consumeVerificationRequired() string {
+	r.verificationMu.Lock()
+	url := r.verificationRequiredURL
+	r.verificationRequiredURL = ""
+	r.verificationMu.Unlock()
+	return url
+}
+
+type privateIPCacheEntry struct {
+	isPrivate bool
+	expiresAt time.Time
+}
+
+const (
+	privateIPCacheTTL      = 5 * time.Minute
+	privateIPErrorCacheTTL = 30 * time.Second
+	maxPrivateIPCacheSize  = 1024
+)
+
+var (
+	privateIPCache   = make(map[string]privateIPCacheEntry)
+	privateIPCacheMu sync.RWMutex
+)
+
+func clearPrivateIPCache() {
+	privateIPCacheMu.Lock()
+	privateIPCache = make(map[string]privateIPCacheEntry)
+	privateIPCacheMu.Unlock()
+}
+
+func newExtensionRuntime(ext *loadedExtension) *extensionRuntime {
+	jar, _ := newSimpleCookieJar()
+
+	runtime := &extensionRuntime{
+		extensionID: ext.ID,
+		manifest:    ext.Manifest,
+		settings:    make(map[string]any),
+		cookieJar:   jar,
+		dataDir:     ext.DataDir,
+		vm:          ext.VM,
+	}
+
+	runtime.httpClient = newExtensionHTTPClient(ext, jar, extensionHTTPTimeout(ext, 30*time.Second), true)
+	runtime.downloadClient = newExtensionHTTPClient(ext, jar, DownloadTimeout, false)
+
+	return runtime
+}
+
+func extensionHTTPTimeout(ext *loadedExtension, fallback time.Duration) time.Duration {
+	if ext == nil || ext.Manifest == nil || ext.Manifest.Capabilities == nil {
+		return fallback
+	}
+
+	raw, ok := ext.Manifest.Capabilities["networkTimeoutSeconds"]
+	if !ok {
+		return fallback
+	}
+
+	seconds := parseExtensionTimeoutSeconds(raw)
+	if seconds <= 0 {
+		return fallback
+	}
+
+	if seconds < 5 {
+		seconds = 5
+	}
+	if seconds > 300 {
+		seconds = 300
+	}
+
+	return time.Duration(seconds) * time.Second
+}
+
+func parseExtensionTimeoutSeconds(raw any) int {
+	switch v := raw.(type) {
+	case int:
+		return v
+	case int32:
+		return int(v)
+	case int64:
+		return int(v)
+	case float32:
+		return int(v)
+	case float64:
+		return int(v)
+	case string:
+		parsed, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil {
+			return 0
+		}
+		return parsed
+	default:
+		return 0
+	}
+}
+
+func (r *extensionRuntime) setActiveDownloadItemID(itemID string) {
+	r.activeDownloadMu.Lock()
+	defer r.activeDownloadMu.Unlock()
+	r.activeDownloadItemID = strings.TrimSpace(itemID)
+}
+
+func (r *extensionRuntime) clearActiveDownloadItemID() {
+	r.activeDownloadMu.Lock()
+	defer r.activeDownloadMu.Unlock()
+	r.activeDownloadItemID = ""
+}
+
+func (r *extensionRuntime) getActiveDownloadItemID() string {
+	r.activeDownloadMu.RLock()
+	defer r.activeDownloadMu.RUnlock()
+	return r.activeDownloadItemID
+}
+
+func (r *extensionRuntime) setActiveRequestID(requestID string) {
+	r.activeRequestMu.Lock()
+	defer r.activeRequestMu.Unlock()
+	r.activeRequestID = strings.TrimSpace(requestID)
+}
+
+func (r *extensionRuntime) clearActiveRequestID() {
+	r.activeRequestMu.Lock()
+	defer r.activeRequestMu.Unlock()
+	r.activeRequestID = ""
+}
+
+func (r *extensionRuntime) getActiveRequestID() string {
+	r.activeRequestMu.RLock()
+	defer r.activeRequestMu.RUnlock()
+	return r.activeRequestID
+}
+
+func (r *extensionRuntime) bindDownloadCancelContext(req *http.Request) *http.Request {
+	if req == nil {
+		return nil
+	}
+	return req.WithContext(r.activeOperationContext(req.Context()))
+}
+
+// activeOperationContext is stable for the full extension operation. An
+// http.Client with a finite Timeout derives a per-request child context and
+// cancels it when that response body closes, so that request context must not
+// be reused for provider retry delays between requests.
+func (r *extensionRuntime) activeOperationContext(fallback context.Context) context.Context {
+	if budget := r.currentResolutionBudget(); budget != nil {
+		return budget.ctx
+	}
+	itemID := r.getActiveDownloadItemID()
+	if itemID == "" {
+		requestID := r.getActiveRequestID()
+		if requestID == "" {
+			if fallback != nil {
+				return fallback
 			}
+			return context.Background()
 		}
-
-		if !replaced {
-			existing =
-				append(
-					existing,
-					newCookie,
-				)
-		}
+		return extensionRequestCancelContext(requestID)
 	}
 
-	jar.cookies[host] =
-		existing
+	return downloadCancelContext(itemID)
 }
 
-/*
- * -------------------------------------------------------------
- * General helpers
- * -------------------------------------------------------------
- */
+// downloadStallTimeout is how long a download may go without receiving a single
+// byte before the stall watchdog aborts it. A dead radio mid-transfer otherwise
+// blocks on Body.Read until the 24h client timeout with no error and no retry.
+const downloadStallTimeout = 60 * time.Second
 
-func formatLogArguments(
-	arguments []goja.Value,
-) string {
-
-	if len(arguments) == 0 {
-		return ""
-	}
-
-	result := ""
-
-	for index, argument := range arguments {
-
-		if index > 0 {
-			result += " "
-		}
-
-		if argument == nil ||
-			argument == goja.Undefined() {
-
-			result += "undefined"
-
-			continue
-		}
-
-		result += argument.String()
-	}
-
-	return result
+// stallWatchdog cancels an in-flight download when no data arrives within
+// timeout. It wraps the request context in a child cancel so firing it does NOT
+// set the user-cancel flag (isDownloadCancelled stays false) — a stall is a
+// distinct, retryable condition. Call reset() after every successful Read and
+// stop() when the transfer ends.
+type stallWatchdog struct {
+	cancel  context.CancelFunc
+	timer   *time.Timer
+	timeout time.Duration
+	stalled atomic.Bool
 }
 
-func GetExtensionMethod(
-	extensionID string,
-	method string,
-) bool {
+func bindStallWatchdog(req *http.Request, timeout time.Duration) (*http.Request, *stallWatchdog) {
+	ctx, cancel := context.WithCancel(req.Context())
+	w := &stallWatchdog{cancel: cancel, timeout: timeout}
+	w.timer = time.AfterFunc(timeout, func() {
+		w.stalled.Store(true)
+		cancel()
+	})
+	return req.WithContext(ctx), w
+}
 
-	extensionsMu.RLock()
+func (w *stallWatchdog) reset() { w.timer.Reset(w.timeout) }
 
-	extension :=
-		extensions[extensionID]
+// stop halts the timer and releases the child context so a completed download
+// leaks neither a pending timer nor a live cancel func.
+func (w *stallWatchdog) stop() {
+	w.timer.Stop()
+	w.cancel()
+}
 
-	extensionsMu.RUnlock()
+func newExtensionHTTPClient(ext *loadedExtension, jar http.CookieJar, timeout time.Duration, compressResponses bool) *http.Client {
+	// Extension sandbox enforces HTTPS-only domains. Do not apply global
+	// allow_http scheme downgrade here, because some extension APIs (e.g.
+	// spotify-web) will redirect http -> https and can end up in 301 loops.
+	// API calls can use response compression for faster metadata/search loads,
+	// while media downloads keep identity transfer semantics for progress/streaming.
+	transport := sharedTransport
+	if compressResponses {
+		transport = extensionAPITransport
+	}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   timeout,
+		Jar:       jar,
+	}
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if req.URL.Scheme != "https" &&
+			!(req.URL.Scheme == "http" && ext.Manifest.Permissions.AllowHTTP) {
+			GoLog("[Extension:%s] Redirect blocked: non-https scheme '%s'\n", ext.ID, req.URL.Scheme)
+			return fmt.Errorf("redirect blocked: only https is allowed")
+		}
 
-	if extension == nil {
+		domain := req.URL.Hostname()
+		if domain == "" {
+			GoLog("[Extension:%s] Redirect blocked: missing hostname\n", ext.ID)
+			return fmt.Errorf("redirect blocked: hostname is required")
+		}
+		if !ext.Manifest.IsDomainAllowed(domain) {
+			GoLog("[Extension:%s] Redirect blocked: domain '%s' not in allowed list\n", ext.ID, domain)
+			return &RedirectBlockedError{Domain: domain}
+		}
+		// The transport resolves and pins every redirect target before dialing.
+		// Reject literals/local aliases here without doing a second, uncancellable
+		// DNS lookup on the redirect path.
+		if isPrivateIPLiteralOrLocal(domain) {
+			GoLog("[Extension:%s] Redirect blocked: private IP '%s'\n", ext.ID, domain)
+			return &RedirectBlockedError{Domain: domain, IsPrivate: true}
+		}
+		if len(via) >= 10 {
+			return http.ErrUseLastResponse
+		}
+		return nil
+	}
+	return client
+}
+
+type RedirectBlockedError struct {
+	Domain    string
+	IsPrivate bool
+}
+
+func (e *RedirectBlockedError) Error() string {
+	if e.IsPrivate {
+		return "redirect blocked: private/local network access denied"
+	}
+	return "redirect blocked: domain '" + e.Domain + "' not in allowed list"
+}
+
+func isPrivateIP(host string) bool {
+	// Opt-in escape hatch: when the user has enabled private/local network
+	// access, treat every host as public so local proxies / custom DNS work.
+	if allowPrivateNetworkAccess.Load() {
 		return false
 	}
 
-	value :=
-		extension.Provider.Get(method)
+	hostLower := strings.ToLower(strings.TrimSpace(host))
+	if hostLower == "" {
+		return false
+	}
+	if isPrivateIPLiteralOrLocal(hostLower) {
+		return true
+	}
 
-	return value != nil &&
-		value != goja.Undefined()
+	if cached, ok := getPrivateIPCache(hostLower); ok {
+		return cached
+	}
+
+	ips, err := net.LookupIP(hostLower)
+	if err != nil {
+		// Defer the final decision to dialWithDoHFallback. It resolves and filters
+		// every concrete address (including DoH answers) before opening a socket.
+		setPrivateIPCache(hostLower, false, privateIPErrorCacheTTL)
+		return false
+	}
+
+	isPrivate := slices.ContainsFunc(ips, isPrivateIPAddr)
+
+	setPrivateIPCache(hostLower, isPrivate, privateIPCacheTTL)
+	return isPrivate
 }
 
-func readExtensionPackage(
-	packagePath string,
-) ([]byte, []byte, error) {
-
-	file, err :=
-		os.Open(packagePath)
-
-	if err != nil {
-		return nil, nil, fmt.Errorf(
-			"unable to open extension: %w",
-			err,
-		)
+// isPrivateIPLiteralOrLocal performs the validation that does not require DNS.
+// Extension HTTP requests use this before dispatch; dialWithDoHFallback remains
+// the authoritative hostname check because it filters and pins the exact DNS
+// answers used by the socket, closing the rebinding window without a duplicate
+// lookup.
+func isPrivateIPLiteralOrLocal(host string) bool {
+	if allowPrivateNetworkAccess.Load() {
+		return false
 	}
-
-	defer file.Close()
-
-	info, err :=
-		file.Stat()
-
-	if err != nil {
-		return nil, nil, fmt.Errorf(
-			"unable to inspect extension: %w",
-			err,
-		)
+	host = strings.ToLower(strings.TrimSpace(host))
+	if host == "" {
+		return false
 	}
-
-	if info.IsDir() {
-		return nil, nil, fmt.Errorf(
-			"extension path is a directory",
-		)
+	if host == "localhost" || strings.HasSuffix(host, ".local") {
+		return true
 	}
-
-	archive, err :=
-		zip.OpenReader(packagePath)
-
-	if err != nil {
-		return nil, nil, fmt.Errorf(
-			"invalid .sflx package: %w",
-			err,
-		)
+	if ip := net.ParseIP(host); ip != nil {
+		return isPrivateIPAddr(ip)
 	}
-
-	defer archive.Close()
-
-	var manifestBytes []byte
-	var scriptBytes []byte
-
-	for _, entry := range archive.File {
-
-		switch entry.Name {
-
-		case "manifest.json":
-
-			manifestBytes, err =
-				readZipEntry(entry)
-
-		case "index.js":
-
-			scriptBytes, err =
-				readZipEntry(entry)
-
-		default:
-
-			continue
-		}
-
-		if err != nil {
-			return nil, nil, err
-		}
-	}
-
-	if len(manifestBytes) == 0 {
-		return nil, nil, fmt.Errorf(
-			"extension is missing manifest.json",
-		)
-	}
-
-	if len(scriptBytes) == 0 {
-		return nil, nil, fmt.Errorf(
-			"extension is missing index.js",
-		)
-	}
-
-	return manifestBytes, scriptBytes, nil
+	return false
 }
 
-func readZipEntry(
-	entry *zip.File,
-) ([]byte, error) {
+func getPrivateIPCache(host string) (bool, bool) {
+	now := time.Now()
 
-	reader, err :=
-		entry.Open()
-
-	if err != nil {
-		return nil, fmt.Errorf(
-			"unable to open %s: %w",
-			entry.Name,
-			err,
-		)
+	privateIPCacheMu.RLock()
+	entry, exists := privateIPCache[host]
+	privateIPCacheMu.RUnlock()
+	if !exists {
+		return false, false
 	}
 
-	defer reader.Close()
-
-	data, err :=
-		io.ReadAll(reader)
-
-	if err != nil {
-		return nil, fmt.Errorf(
-			"unable to read %s: %w",
-			entry.Name,
-			err,
-		)
+	if now.Before(entry.expiresAt) {
+		return entry.isPrivate, true
 	}
 
-	return data, nil
+	privateIPCacheMu.Lock()
+	delete(privateIPCache, host)
+	privateIPCacheMu.Unlock()
+	return false, false
 }
 
-func manifestJSON(
-	manifest extensionManifest,
-) (string, error) {
+func setPrivateIPCache(host string, isPrivate bool, ttl time.Duration) {
+	expiresAt := time.Now().Add(ttl)
 
-	data, err :=
-		json.Marshal(manifest)
-
-	if err != nil {
-		return "", fmt.Errorf(
-			"unable to serialize manifest: %w",
-			err,
-		)
+	privateIPCacheMu.Lock()
+	if len(privateIPCache) >= maxPrivateIPCacheSize {
+		now := time.Now()
+		for key, entry := range privateIPCache {
+			if now.After(entry.expiresAt) {
+				delete(privateIPCache, key)
+			}
+		}
+		if len(privateIPCache) >= maxPrivateIPCacheSize {
+			privateIPCache = make(map[string]privateIPCacheEntry)
+		}
 	}
-
-	return string(data), nil
+	privateIPCache[host] = privateIPCacheEntry{
+		isPrivate: isPrivate,
+		expiresAt: expiresAt,
+	}
+	privateIPCacheMu.Unlock()
 }
 
-func LoadExtensionsFromDirectory(
-	directoryPath string,
-) (string, error) {
+func isPrivateIPAddr(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() ||
+		ip.IsPrivate() ||
+		ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() ||
+		ip.IsMulticast() ||
+		ip.IsUnspecified() {
+		return true
+	}
+	if !ip.IsGlobalUnicast() {
+		return true
+	}
+	return false
+}
 
-	entries, err :=
-		os.ReadDir(directoryPath)
+type simpleCookieJar struct {
+	mu  sync.RWMutex
+	jar *cookiejar.Jar
+}
 
+func newSimpleCookieJar() (*simpleCookieJar, error) {
+	jar, err := cookiejar.New(nil)
 	if err != nil {
-		return "", fmt.Errorf(
-			"unable to read extension directory: %w",
-			err,
-		)
+		return nil, err
+	}
+	return &simpleCookieJar{jar: jar}, nil
+}
+
+func (j *simpleCookieJar) SetCookies(u *url.URL, cookies []*http.Cookie) {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	j.jar.SetCookies(u, cookies)
+}
+
+func (j *simpleCookieJar) Cookies(u *url.URL) []*http.Cookie {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	return j.jar.Cookies(u)
+
+}
+
+func (j *simpleCookieJar) Clear() {
+	jar, _ := cookiejar.New(nil)
+	j.mu.Lock()
+	j.jar = jar
+	j.mu.Unlock()
+}
+
+func (r *extensionRuntime) SetSettings(settings map[string]any) {
+	r.settings = settings
+}
+
+func (r *extensionRuntime) RegisterAPIs(vm *goja.Runtime) {
+	r.vm = vm
+
+	httpObj := vm.NewObject()
+	httpObj.Set("get", r.httpGet)
+	httpObj.Set("post", r.httpPost)
+	httpObj.Set("put", r.httpPut)
+	httpObj.Set("delete", r.httpDelete)
+	httpObj.Set("patch", r.httpPatch)
+	httpObj.Set("request", r.httpRequest)
+	httpObj.Set("clearCookies", r.httpClearCookies)
+	vm.Set("http", httpObj)
+
+	if r.manifest != nil && r.manifest.Permissions.Storage {
+		storageObj := vm.NewObject()
+		storageObj.Set("get", r.storageGet)
+		storageObj.Set("set", r.storageSet)
+		storageObj.Set("remove", r.storageRemove)
+		vm.Set("storage", storageObj)
+
+		credentialsObj := vm.NewObject()
+		credentialsObj.Set("store", r.credentialsStore)
+		credentialsObj.Set("get", r.credentialsGet)
+		credentialsObj.Set("remove", r.credentialsRemove)
+		credentialsObj.Set("has", r.credentialsHas)
+		vm.Set("credentials", credentialsObj)
 	}
 
-	loaded :=
-		make([]string, 0)
+	if r.manifest != nil && r.manifest.Permissions.Storage {
+		authObj := vm.NewObject()
+		authObj.Set("openAuthUrl", r.authOpenUrl)
+		authObj.Set("getAuthCode", r.authGetCode)
+		authObj.Set("setAuthCode", r.authSetCode)
+		authObj.Set("clearAuth", r.authClear)
+		authObj.Set("isAuthenticated", r.authIsAuthenticated)
+		authObj.Set("getTokens", r.authGetTokens)
+		authObj.Set("generatePKCE", r.authGeneratePKCE)
+		authObj.Set("getPKCE", r.authGetPKCE)
+		authObj.Set("startOAuthWithPKCE", r.authStartOAuthWithPKCE)
+		authObj.Set("exchangeCodeWithPKCE", r.authExchangeCodeWithPKCE)
+		vm.Set("auth", authObj)
 
-	for _, entry := range entries {
-
-		if entry.IsDir() {
-			continue
+		if r.manifest.SignedSession != nil {
+			sessionObj := vm.NewObject()
+			sessionObj.Set("signedFetch", r.signedSessionFetch)
+			sessionObj.Set("completeGrant", r.signedSessionCompleteGrant)
+			sessionObj.Set("status", r.signedSessionStatus)
+			sessionObj.Set("clear", r.signedSessionClear)
+			vm.Set("session", sessionObj)
 		}
-
-		name :=
-			entry.Name()
-
-		if len(name) < 5 ||
-			name[len(name)-5:] != ".sflx" {
-
-			continue
-		}
-
-		packagePath :=
-			fmt.Sprintf(
-				"%s/%s",
-				directoryPath,
-				name,
-			)
-
-		manifestJSON, err :=
-			LoadExtension(packagePath)
-
-		if err != nil {
-			return "", fmt.Errorf(
-				"failed to load %s: %w",
-				name,
-				err,
-			)
-		}
-
-		var manifest extensionManifest
-
-		if err := json.Unmarshal(
-			[]byte(manifestJSON),
-			&manifest,
-		); err != nil {
-
-			return "", fmt.Errorf(
-				"failed to read loaded extension metadata: %w",
-				err,
-			)
-		}
-
-		loaded =
-			append(
-				loaded,
-				manifest.Name,
-			)
 	}
 
-	result, err :=
-		json.Marshal(loaded)
+	if r.manifest != nil && r.manifest.Permissions.File {
+		fileObj := vm.NewObject()
+		fileObj.Set("download", r.fileDownload)
+		fileObj.Set("downloadSegments", r.fileDownloadSegments)
+		fileObj.Set("exists", r.fileExists)
+		fileObj.Set("delete", r.fileDelete)
+		fileObj.Set("read", r.fileRead)
+		fileObj.Set("readBytes", r.fileReadBytes)
+		fileObj.Set("write", r.fileWrite)
+		fileObj.Set("writeBytes", r.fileWriteBytes)
+		fileObj.Set("copy", r.fileCopy)
+		fileObj.Set("move", r.fileMove)
+		fileObj.Set("getSize", r.fileGetSize)
+		fileObj.Set("transformPatternedBlocks", r.fileTransformPatternedBlocks)
+		vm.Set("file", fileObj)
 
-	if err != nil {
-		return "", fmt.Errorf(
-			"unable to serialize loaded extensions: %w",
-			err,
-		)
+		ffmpegObj := vm.NewObject()
+		if r.manifest.HasCapability("rawFfmpeg") {
+			ffmpegObj.Set("execute", r.ffmpegExecute)
+		}
+		ffmpegObj.Set("getInfo", r.ffmpegGetInfo)
+		ffmpegObj.Set("convert", r.ffmpegConvert)
+		vm.Set("ffmpeg", ffmpegObj)
 	}
 
-	return string(result), nil
+	matchingObj := vm.NewObject()
+	matchingObj.Set("compareStrings", r.matchingCompareStrings)
+	matchingObj.Set("compareDuration", r.matchingCompareDuration)
+	matchingObj.Set("normalizeString", r.matchingNormalizeString)
+	vm.Set("matching", matchingObj)
+
+	utilsObj := vm.NewObject()
+	utilsObj.Set("base64Encode", r.base64Encode)
+	utilsObj.Set("base64Decode", r.base64Decode)
+	utilsObj.Set("md5", r.md5Hash)
+	utilsObj.Set("sha256", r.sha256Hash)
+	utilsObj.Set("hmacSHA256", r.hmacSHA256)
+	utilsObj.Set("hmacSHA256Base64", r.hmacSHA256Base64)
+	utilsObj.Set("hmacSHA1", r.hmacSHA1)
+	utilsObj.Set("parseJSON", r.parseJSON)
+	utilsObj.Set("stringifyJSON", r.stringifyJSON)
+	utilsObj.Set("encrypt", r.cryptoEncrypt)
+	utilsObj.Set("decrypt", r.cryptoDecrypt)
+	utilsObj.Set("encryptBlockCipher", r.encryptBlockCipher)
+	utilsObj.Set("decryptBlockCipher", r.decryptBlockCipher)
+	utilsObj.Set("decryptCTRSegments", r.decryptCTRSegments)
+	utilsObj.Set("generateKey", r.cryptoGenerateKey)
+	utilsObj.Set("randomUserAgent", r.randomUserAgent)
+	utilsObj.Set("appVersion", r.appVersion)
+	utilsObj.Set("appUserAgent", r.appUserAgent)
+	utilsObj.Set("sleep", r.sleep)
+	utilsObj.Set("getResolutionRemainingMs", r.getResolutionRemainingMs)
+	utilsObj.Set("isDownloadCancelled", r.isDownloadCancelled)
+	utilsObj.Set("isRequestCancelled", r.isRequestCancelled)
+	utilsObj.Set("setDownloadStatus", r.setDownloadStatus)
+	vm.Set("utils", utilsObj)
+
+	logObj := vm.NewObject()
+	logObj.Set("debug", r.logDebug)
+	logObj.Set("info", r.logInfo)
+	logObj.Set("warn", r.logWarn)
+	logObj.Set("error", r.logError)
+	vm.Set("log", logObj)
+
+	vm.Set("fetch", r.fetchPolyfill)
+
+	vm.Set("atob", r.atobPolyfill)
+	vm.Set("btoa", r.btoaPolyfill)
+
+	r.registerTextEncoderDecoder(vm)
+
+	r.registerURLClass(vm)
+
+	r.registerJSONGlobal(vm)
 }

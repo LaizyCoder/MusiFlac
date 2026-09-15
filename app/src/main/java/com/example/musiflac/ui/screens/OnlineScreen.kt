@@ -33,6 +33,9 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -48,7 +51,6 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.platform.LocalContext
-import android.util.Log
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
@@ -58,6 +60,7 @@ import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import androidx.compose.ui.layout.ContentScale
 import com.laizycoder.musiflac.online.Extension
+import com.laizycoder.musiflac.ui.screens.DownloadFolderSettings
 import com.laizycoder.musiflac.online.ExtensionManager
 import com.laizycoder.musiflac.online.ExtensionType
 import com.laizycoder.musiflac.online.GoBackend
@@ -94,7 +97,8 @@ private enum class SearchCategory(
 fun OnlineScreen(
     extensionManager: ExtensionManager,
     musicPlayer: MusicPlayer,
-    paddingValues: androidx.compose.foundation.layout.PaddingValues
+    paddingValues: androidx.compose.foundation.layout.PaddingValues,
+    onDownloadComplete: () -> Unit = {}
 ) {
     val context = LocalContext.current
 
@@ -152,19 +156,81 @@ fun OnlineScreen(
         mutableStateOf<OnlineTrack?>(null)
     }
 
-    var actionRunning by remember {
+    var selectedDownloadProvider by remember {
+        mutableStateOf<Extension?>(null)
+    }
+
+    var selectedQuality by remember {
+        mutableStateOf<ExtensionManager.DownloadQuality?>(null)
+    }
+
+    var downloadRunning by remember {
         mutableStateOf(false)
     }
 
-    var actionLabel by remember {
-        mutableStateOf("")
-    }
-
-    var actionError by remember {
+    var downloadError by remember {
         mutableStateOf<String?>(null)
     }
 
     val scope = rememberCoroutineScope()
+
+    val downloadProviders = remember(extensionManager) {
+        extensionManager
+            .getEnabled()
+            .filter { ExtensionType.DOWNLOAD in it.types }
+    }
+
+    fun openDownloadSheet(track: OnlineTrack) {
+        selectedTrack = track
+        selectedDownloadProvider = downloadProviders.firstOrNull()
+        selectedQuality = selectedDownloadProvider
+            ?.let { extensionManager.getDownloadQualities(it.id).firstOrNull() }
+        downloadError = null
+    }
+
+    fun startDownload(
+        track: OnlineTrack,
+        provider: Extension,
+        quality: ExtensionManager.DownloadQuality
+    ) {
+        if (downloadRunning) return
+
+        downloadRunning = true
+        downloadError = null
+
+        scope.launch {
+            try {
+                val result = withContext(Dispatchers.IO) {
+                    OnlineDownloadResolver.resolveAndDownload(
+                        context = context,
+                        extensionManager = extensionManager,
+                        track = track,
+                        providerId = provider.id,
+                        qualityId = quality.id,
+                        outputDirectory = File(
+                            DownloadFolderSettings
+                                .getPath(
+                                    context
+                                )
+                        )
+                    )
+                }
+
+                if (result.success) {
+                    onDownloadComplete()
+                    selectedTrack = null
+                    selectedDownloadProvider = null
+                    selectedQuality = null
+                } else {
+                    downloadError = result.error ?: "Download failed."
+                }
+            } catch (error: Throwable) {
+                downloadError = error.message ?: "Download failed."
+            } finally {
+                downloadRunning = false
+            }
+        }
+    }
 
     fun search() {
         val searchQuery = query.trim()
@@ -218,37 +284,13 @@ fun OnlineScreen(
                     vertical = 12.dp
                 )
         ) {
-            if (actionRunning) {
+            if (downloadError != null) {
                 AlertDialog(
-                    onDismissRequest = {},
-                    title = { Text("Online ${if (actionLabel.startsWith("Downloading")) "Download" else "Playback"}") },
-                    text = {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(12.dp)
-                        ) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(24.dp),
-                                strokeWidth = 2.dp,
-                                color = Accent
-                            )
-                            Text(
-                                text = actionLabel.ifBlank { "Working..." },
-                                color = MaterialTheme.colorScheme.onSurface
-                            )
-                        }
-                    },
-                    confirmButton = {}
-                )
-            }
-
-            actionError?.let { message ->
-                AlertDialog(
-                    onDismissRequest = { actionError = null },
-                    title = { Text("Online action failed") },
-                    text = { Text(message) },
+                    onDismissRequest = { downloadError = null },
+                    title = { Text("Download failed") },
+                    text = { Text(downloadError ?: "Download failed.") },
                     confirmButton = {
-                        Button(onClick = { actionError = null }) {
+                        Button(onClick = { downloadError = null }) {
                             Text("OK")
                         }
                     }
@@ -256,88 +298,32 @@ fun OnlineScreen(
             }
 
             selectedTrack?.let { track ->
-                OnlineTrackActionDialog(
+                DownloadBottomSheet(
                     track = track,
+                    providers = downloadProviders,
+                    selectedProvider = selectedDownloadProvider,
+                    selectedQuality = selectedQuality,
+                    qualitiesForProvider = { provider ->
+                        extensionManager.getDownloadQualities(provider.id)
+                    },
+                    downloading = downloadRunning,
+                    onProviderSelected = { provider ->
+                        selectedDownloadProvider = provider
+                        selectedQuality = extensionManager
+                            .getDownloadQualities(provider.id)
+                            .firstOrNull()
+                    },
+                    onQualitySelected = { quality ->
+                        selectedQuality = quality
+                    },
+                    onDownload = { provider, quality ->
+                        startDownload(track, provider, quality)
+                    },
                     onDismiss = {
-                        selectedTrack = null
-                    },
-                    onPlay = {
-                        val trackToPlay = track
-                        selectedTrack = null
-                        actionError = null
-                        actionLabel = "Resolving ${trackToPlay.title}..."
-                        actionRunning = true
-                        Log.d("OnlineScreen", "PLAY clicked: ${trackToPlay.title} - ${trackToPlay.artist}")
-
-                        scope.launch {
-                            try {
-                                val result = withContext(Dispatchers.IO) {
-                                    OnlineDownloadResolver.resolveAndDownload(
-                                        context = context,
-                                        extensionManager = extensionManager,
-                                        track = trackToPlay,
-                                        outputDirectory = File(
-                                            context.cacheDir,
-                                            "online_playback"
-                                        )
-                                    )
-                                }
-
-                                Log.d("OnlineScreen", "PLAY resolver result: $result")
-
-                                if (result.success && result.filePath != null) {
-                                    actionLabel = "Starting playback..."
-                                    musicPlayer.playOnline(
-                                        trackToPlay,
-                                        result.filePath
-                                    )
-                                    actionRunning = false
-                                } else {
-                                    actionRunning = false
-                                    actionError = result.error ?: "Unable to play this track."
-                                }
-                            } catch (error: Throwable) {
-                                Log.e("OnlineScreen", "PLAY failed", error)
-                                actionRunning = false
-                                actionError = error.message ?: "Unable to play this track."
-                            }
-                        }
-                    },
-                    onDownload = {
-                        val trackToDownload = track
-                        selectedTrack = null
-                        actionError = null
-                        actionLabel = "Downloading ${trackToDownload.title}..."
-                        actionRunning = true
-                        Log.d("OnlineScreen", "DOWNLOAD clicked: ${trackToDownload.title} - ${trackToDownload.artist}")
-
-                        scope.launch {
-                            try {
-                                val result = withContext(Dispatchers.IO) {
-                                    OnlineDownloadResolver.resolveAndDownload(
-                                        context = context,
-                                        extensionManager = extensionManager,
-                                        track = trackToDownload,
-                                        outputDirectory = File(
-                                            context.getExternalFilesDir(
-                                                android.os.Environment.DIRECTORY_MUSIC
-                                            ) ?: context.filesDir,
-                                            "MusiFlac"
-                                        )
-                                    )
-                                }
-
-                                Log.d("OnlineScreen", "DOWNLOAD resolver result: $result")
-
-                                actionRunning = false
-                                if (!result.success) {
-                                    actionError = result.error ?: "Download failed."
-                                }
-                            } catch (error: Throwable) {
-                                Log.e("OnlineScreen", "DOWNLOAD failed", error)
-                                actionRunning = false
-                                actionError = error.message ?: "Download failed."
-                            }
+                        if (!downloadRunning) {
+                            selectedTrack = null
+                            selectedDownloadProvider = null
+                            selectedQuality = null
                         }
                     }
                 )
@@ -509,7 +495,7 @@ fun OnlineScreen(
                                 OnlineTrackItem(
                                     track = result.track,
                                     onClick = {
-                                        selectedTrack = result.track
+                                        openDownloadSheet(result.track)
                                     }
                                 )
                             }
@@ -533,59 +519,290 @@ fun OnlineScreen(
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun OnlineTrackActionDialog(
+private fun DownloadBottomSheet(
     track: OnlineTrack,
-    onDismiss: () -> Unit,
-    onPlay: () -> Unit,
-    onDownload: () -> Unit
+    providers: List<Extension>,
+    selectedProvider: Extension?,
+    selectedQuality: ExtensionManager.DownloadQuality?,
+    qualitiesForProvider: (Extension) -> List<ExtensionManager.DownloadQuality>,
+    downloading: Boolean,
+    onProviderSelected: (Extension) -> Unit,
+    onQualitySelected: (ExtensionManager.DownloadQuality) -> Unit,
+    onDownload: (Extension, ExtensionManager.DownloadQuality) -> Unit,
+    onDismiss: () -> Unit
 ) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = {
-            Text(
-                text = track.title,
-                color = MaterialTheme.colorScheme.onSurface
-            )
-        },
-        text = {
-            Column {
-                Text(
-                    text = track.artist,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    fontSize = 15.sp
-                )
+    val sheetState = rememberModalBottomSheetState(
+        skipPartiallyExpanded = true
+    )
 
-                track.album
-                    ?.takeIf { it.isNotBlank() }
-                    ?.let { album ->
-                        Text(
-                            text = album,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            fontSize = 14.sp,
-                            modifier = Modifier.padding(top = 4.dp)
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
+        containerColor = MaterialTheme.colorScheme.surface,
+        dragHandle = {
+            Box(
+                modifier = Modifier
+                    .padding(top = 12.dp)
+                    .size(width = 44.dp, height = 5.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(MaterialTheme.colorScheme.onSurfaceVariant)
+            )
+        }
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 20.dp)
+                .padding(bottom = 28.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(64.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(MaterialTheme.colorScheme.surfaceVariant),
+                    contentAlignment = Alignment.Center
+                ) {
+                    if (!track.artworkUrl.isNullOrBlank()) {
+                        AsyncImage(
+                            model = track.artworkUrl,
+                            contentDescription = "Album artwork",
+                            modifier = Modifier.fillMaxSize(),
+                            contentScale = ContentScale.Crop
+                        )
+                    } else {
+                        Icon(
+                            imageVector = Icons.Default.Album,
+                            contentDescription = null,
+                            tint = Accent,
+                            modifier = Modifier.size(28.dp)
                         )
                     }
-            }
-        },
-        confirmButton = {
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Button(
-                    onClick = onPlay
-                ) {
-                    Text("Play")
                 }
 
-                Button(
-                    onClick = onDownload
+                Spacer(modifier = Modifier.width(14.dp))
+
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = track.title,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        fontSize = 19.sp,
+                        maxLines = 1
+                    )
+                    Text(
+                        text = track.artist,
+                        color = SecondaryText,
+                        fontSize = 15.sp,
+                        maxLines = 1,
+                        modifier = Modifier.padding(top = 3.dp)
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(24.dp))
+
+            Text(
+                text = "Download From",
+                color = MaterialTheme.colorScheme.onSurface,
+                fontSize = 18.sp
+            )
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            if (providers.isEmpty()) {
+                Text(
+                    text = "No download extensions enabled",
+                    color = SecondaryText,
+                    fontSize = 15.sp
+                )
+            } else {
+                LazyRow(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
+                    items(providers) { provider ->
+                        val selected = provider.id == selectedProvider?.id
+                        val isYoutube = provider.name.contains("youtube", true)
+
+                        Surface(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(14.dp))
+                                .clickable(enabled = !downloading) {
+                                    onProviderSelected(provider)
+                                },
+                            shape = RoundedCornerShape(14.dp),
+                            color = if (selected) {
+                                Accent.copy(alpha = 0.22f)
+                            } else {
+                                MaterialTheme.colorScheme.surfaceVariant
+                            }
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(
+                                    horizontal = 14.dp,
+                                    vertical = 11.dp
+                                ),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(10.dp)
+                                        .clip(androidx.compose.foundation.shape.CircleShape)
+                                        .background(
+                                            if (isYoutube) {
+                                                Color(0xFFCC0000)
+                                            } else {
+                                                Color(0xFF25D17D)
+                                            }
+                                        )
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = provider.name,
+                                    color = if (selected) Accent else MaterialTheme.colorScheme.onSurface,
+                                    fontSize = 15.sp,
+                                    maxLines = 1
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(24.dp))
+
+            val qualities = selectedProvider?.let(qualitiesForProvider).orEmpty()
+
+            Text(
+                text = "Select Quality",
+                color = MaterialTheme.colorScheme.onSurface,
+                fontSize = 18.sp
+            )
+
+            Spacer(modifier = Modifier.height(10.dp))
+
+            if (qualities.isEmpty()) {
+                Text(
+                    text = "This extension does not expose any download qualities.",
+                    color = SecondaryText,
+                    fontSize = 15.sp
+                )
+            } else {
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    qualities.forEach { quality ->
+                        val selected = quality.id == selectedQuality?.id
+
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(16.dp))
+                                .clickable(enabled = !downloading) {
+                                    onQualitySelected(quality)
+                                }
+                                .padding(10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(56.dp)
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(
+                                        if (selected) Accent.copy(alpha = 0.22f)
+                                        else MaterialTheme.colorScheme.surfaceVariant
+                                    ),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    text = qualityBadge(quality),
+                                    color = Accent,
+                                    fontSize = 12.sp
+                                )
+                            }
+
+                            Spacer(modifier = Modifier.width(14.dp))
+
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = quality.label,
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    fontSize = 17.sp,
+                                    maxLines = 1
+                                )
+                                quality.description
+                                    ?.takeIf { it.isNotBlank() }
+                                    ?.let { description ->
+                                        Text(
+                                            text = description,
+                                            color = SecondaryText,
+                                            fontSize = 14.sp,
+                                            maxLines = 2,
+                                            modifier = Modifier.padding(top = 3.dp)
+                                        )
+                                    }
+                            }
+
+                            if (selected) {
+                                Icon(
+                                    imageVector = Icons.Default.Check,
+                                    contentDescription = "Selected",
+                                    tint = Accent,
+                                    modifier = Modifier.size(24.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(18.dp))
+
+            Button(
+                onClick = {
+                    val provider = selectedProvider
+                    val quality = selectedQuality
+                    if (provider != null && quality != null) {
+                        onDownload(provider, quality)
+                    }
+                },
+                enabled = !downloading && selectedProvider != null && selectedQuality != null,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                if (downloading) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(20.dp),
+                        strokeWidth = 2.dp
+                    )
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Text("Downloading...")
+                } else {
                     Text("Download")
                 }
             }
         }
-    )
+    }
+}
+
+private fun qualityBadge(quality: ExtensionManager.DownloadQuality): String {
+    val text = "${quality.label} ${quality.description.orEmpty()}".lowercase()
+
+    return when {
+        "atmos" in text -> "♫"
+        "dolby" in text -> "♫"
+        "24-bit" in text || "hi-res" in text || "192khz" in text || "96khz" in text -> "4K"
+        "320kbps" in text -> "320"
+        "128kbps" in text -> "128"
+        "opus" in text -> "O"
+        "flac" in text || "lossless" in text -> "♫"
+        else -> "♫"
+    }
 }
 
 @Composable
